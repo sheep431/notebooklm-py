@@ -169,6 +169,9 @@ notebooklm use <notebook_id>
 notebooklm source add "https://en.wikipedia.org/wiki/Artificial_intelligence"
 notebooklm source add "./paper.pdf"
 
+# Or bootstrap a notebook from a JSON manifest
+notebooklm bootstrap ./bootstrap.json
+
 # 3. Chat with your sources
 notebooklm ask "What are the key themes?"
 notebooklm ask --prompt-file ./long_question.txt  # Read question from file
@@ -202,6 +205,7 @@ Other useful CLI commands:
 notebooklm auth check --test         # Diagnose auth/cookie issues
 notebooklm auth refresh --quiet      # One-shot cookie keepalive (for cron / launchd / systemd)
 notebooklm auth refresh --browser-cookies chrome  # Re-extract and repair account routing
+notebooklm bootstrap ./bootstrap.json  # Create/reuse a notebook and bulk-import sources
 notebooklm agent show codex          # Print bundled Codex instructions
 notebooklm agent show claude         # Print bundled Claude Code skill template
 notebooklm language list             # List supported output languages

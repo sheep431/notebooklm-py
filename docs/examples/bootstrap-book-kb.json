@@ -1,0 +1,24 @@
+{
+  "title": "Book Workflow Knowledge Base",
+  "if_exists": "reuse",
+  "use": true,
+  "sources": [
+    {
+      "type": "file",
+      "content": "./docs/book-production-workflow.md"
+    },
+    {
+      "type": "file",
+      "content": "./docs/book-writing-checklist.md"
+    },
+    {
+      "type": "url",
+      "content": "https://example.com/publisher-style-guide"
+    },
+    {
+      "type": "text",
+      "title": "Reader Persona",
+      "content": "Target readers: finance professionals learning Python for practical work automation."
+    }
+  ]
+}

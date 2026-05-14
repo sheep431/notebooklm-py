@@ -304,6 +304,142 @@ class TestNotebookCreate:
 
 
 # =============================================================================
+# NOTEBOOK BOOTSTRAP TESTS
+# =============================================================================
+
+
+class TestNotebookBootstrap:
+    def test_notebook_bootstrap_creates_notebook_and_imports_sources(
+        self, runner, mock_auth, mock_context_file, tmp_path
+    ):
+        manifest_path = tmp_path / "bootstrap.json"
+        source_file = tmp_path / "workflow.md"
+        source_file.write_text("# workflow\n", encoding="utf-8")
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "title": "Book Workflow KB",
+                    "use": True,
+                    "sources": [
+                        {"content": str(source_file)},
+                        {"content": "https://example.com/spec"},
+                        {"title": "Notes", "content": "draft checklist"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch_main_cli_client() as mock_client_cls:
+            mock_client = create_mock_client()
+            mock_client.notebooks.list = AsyncMock(return_value=[])
+            mock_client.notebooks.create = AsyncMock(
+                return_value=Notebook(
+                    id="nb_bootstrap",
+                    title="Book Workflow KB",
+                    created_at=datetime(2024, 1, 1),
+                    is_owner=True,
+                )
+            )
+            mock_client.sources.add_file = AsyncMock(
+                return_value=MagicMock(id="src_file", title="workflow.md", kind="file", url=None)
+            )
+            mock_client.sources.add_url = AsyncMock(
+                side_effect=[
+                    MagicMock(
+                        id="src_url", title="example.com", kind="url", url="https://example.com/spec"
+                    )
+                ]
+            )
+            mock_client.sources.add_text = AsyncMock(
+                return_value=MagicMock(id="src_text", title="Notes", kind="text", url=None)
+            )
+            mock_client_cls.return_value = mock_client
+
+            with patch(
+                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            ) as mock_fetch:
+                mock_fetch.return_value = ("csrf", "session")
+                result = runner.invoke(cli, ["bootstrap", str(manifest_path), "--json"])
+
+            assert result.exit_code == 0
+            data = json.loads(result.output)
+            assert data["notebook"]["id"] == "nb_bootstrap"
+            assert data["notebook"]["action"] == "created"
+            assert data["source_count"] == 3
+            assert data["sources_added"][0]["detected_type"] == "file"
+            assert data["sources_added"][1]["detected_type"] == "url"
+            assert data["sources_added"][2]["detected_type"] == "text"
+            context = json.loads(mock_context_file.read_text())
+            assert context["notebook_id"] == "nb_bootstrap"
+            mock_client.sources.add_file.assert_awaited_once()
+            mock_client.sources.add_url.assert_awaited_once_with(
+                "nb_bootstrap", "https://example.com/spec"
+            )
+            mock_client.sources.add_text.assert_awaited_once_with(
+                "nb_bootstrap", "Notes", "draft checklist"
+            )
+
+    def test_notebook_bootstrap_reuses_existing_notebook(self, runner, mock_auth, tmp_path):
+        manifest_path = tmp_path / "bootstrap.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "title": "Existing KB",
+                    "if_exists": "reuse",
+                    "sources": [{"type": "text", "title": "Intro", "content": "hello"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        existing = Notebook(
+            id="nb_existing",
+            title="Existing KB",
+            created_at=datetime(2024, 1, 2),
+            is_owner=True,
+        )
+
+        with patch_main_cli_client() as mock_client_cls:
+            mock_client = create_mock_client()
+            mock_client.notebooks.list = AsyncMock(return_value=[existing])
+            mock_client.notebooks.create = AsyncMock()
+            mock_client.sources.add_text = AsyncMock(
+                return_value=MagicMock(id="src_text", title="Intro", kind="text", url=None)
+            )
+            mock_client_cls.return_value = mock_client
+
+            with patch(
+                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            ) as mock_fetch:
+                mock_fetch.return_value = ("csrf", "session")
+                result = runner.invoke(cli, ["bootstrap", str(manifest_path), "--json"])
+
+            assert result.exit_code == 0
+            data = json.loads(result.output)
+            assert data["notebook"]["id"] == "nb_existing"
+            assert data["notebook"]["action"] == "reused"
+            mock_client.notebooks.create.assert_not_called()
+
+    def test_notebook_bootstrap_rejects_non_json_manifest(self, runner, mock_auth, tmp_path):
+        manifest_path = tmp_path / "bootstrap.yaml"
+        manifest_path.write_text("title: nope\n", encoding="utf-8")
+
+        with patch_main_cli_client() as mock_client_cls:
+            mock_client = create_mock_client()
+            mock_client_cls.return_value = mock_client
+
+            with patch(
+                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            ) as mock_fetch:
+                mock_fetch.return_value = ("csrf", "session")
+                result = runner.invoke(cli, ["bootstrap", str(manifest_path)])
+
+            assert result.exit_code == 1
+            assert "must be a .json file" in result.output
+
+
+# =============================================================================
 # NOTEBOOK DELETE TESTS
 # =============================================================================
 

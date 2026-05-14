@@ -11,6 +11,9 @@ Commands:
 Note: Sharing commands moved to 'share' command group.
 """
 
+import json
+from pathlib import Path
+
 import click
 from rich.table import Table
 
@@ -25,6 +28,113 @@ from .helpers import (
     set_current_notebook,
     with_client,
 )
+
+_ALLOWED_BOOTSTRAP_SOURCE_TYPES = {"url", "text", "file", "youtube"}
+_ALLOWED_BOOTSTRAP_IF_EXISTS = {"reuse", "error", "create"}
+
+
+def _load_bootstrap_manifest(manifest_path: Path) -> dict:
+    path = Path(manifest_path).expanduser().resolve()
+    if path.suffix.lower() != ".json":
+        raise click.ClickException("Bootstrap manifest must be a .json file")
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as e:
+        raise click.ClickException(f"Manifest not found: {path}") from e
+    except json.JSONDecodeError as e:
+        raise click.ClickException(f"Invalid JSON in manifest: {e}") from e
+
+    if not isinstance(data, dict):
+        raise click.ClickException("Bootstrap manifest root must be a JSON object")
+
+    title = data.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise click.ClickException("Bootstrap manifest requires a non-empty string field: title")
+
+    raw_sources = data.get("sources", [])
+    if not isinstance(raw_sources, list):
+        raise click.ClickException("Bootstrap manifest field 'sources' must be a list")
+
+    if_exists = data.get("if_exists", "reuse")
+    if if_exists not in _ALLOWED_BOOTSTRAP_IF_EXISTS:
+        raise click.ClickException(
+            "Bootstrap manifest field 'if_exists' must be one of: create, error, reuse"
+        )
+
+    use_context = data.get("use", False)
+    if not isinstance(use_context, bool):
+        raise click.ClickException("Bootstrap manifest field 'use' must be true or false")
+
+    sources = []
+    for index, raw_source in enumerate(raw_sources, 1):
+        if not isinstance(raw_source, dict):
+            raise click.ClickException(f"Bootstrap source #{index} must be an object")
+
+        content = raw_source.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise click.ClickException(
+                f"Bootstrap source #{index} requires a non-empty string field: content"
+            )
+
+        source_type = raw_source.get("type")
+        if source_type is not None and source_type not in _ALLOWED_BOOTSTRAP_SOURCE_TYPES:
+            raise click.ClickException(
+                f"Bootstrap source #{index} has invalid type '{source_type}'. "
+                "Expected one of: file, text, url, youtube"
+            )
+
+        source_title = raw_source.get("title")
+        if source_title is not None and not isinstance(source_title, str):
+            raise click.ClickException(f"Bootstrap source #{index} field 'title' must be a string")
+
+        mime_type = raw_source.get("mime_type")
+        if mime_type is not None and not isinstance(mime_type, str):
+            raise click.ClickException(
+                f"Bootstrap source #{index} field 'mime_type' must be a string"
+            )
+
+        sources.append(
+            {
+                "type": source_type,
+                "content": content,
+                "title": source_title,
+                "mime_type": mime_type,
+            }
+        )
+
+    return {
+        "path": str(path),
+        "title": title.strip(),
+        "if_exists": if_exists,
+        "use": use_context,
+        "sources": sources,
+    }
+
+
+def _detect_bootstrap_source_type(source: dict) -> str:
+    source_type = source.get("type")
+    if source_type is not None:
+        return source_type
+
+    content = source["content"]
+    if content.startswith(("http://", "https://")):
+        lowered = content.lower()
+        if "youtube.com/" in lowered or "youtu.be/" in lowered:
+            return "youtube"
+        return "url"
+
+    if Path(content).expanduser().exists():
+        return "file"
+
+    return "text"
+
+
+def _find_notebook_by_title(notebooks: list, title: str):
+    for notebook in notebooks:
+        if getattr(notebook, "title", None) == title:
+            return notebook
+    return None
 
 
 def register_notebook_commands(cli):
@@ -118,6 +228,117 @@ def register_notebook_commands(cli):
                         f"[dim]Tip: pass --use next time, or run 'notebooklm use {nb.id}'.[/dim]"
                     )
 
+        return _run()
+
+    @cli.command("bootstrap")
+    @click.argument("manifest_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+    @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+    @with_client
+    def bootstrap_cmd(ctx, manifest_path, json_output, client_auth):
+        """Create or reuse a notebook from a JSON manifest, then import sources.
+
+        Manifest schema:
+          {
+            "title": "Notebook title",
+            "if_exists": "reuse|error|create",
+            "use": true,
+            "sources": [
+              {"type": "file", "content": "./docs/a.md"},
+              {"type": "url", "content": "https://example.com"},
+              {"type": "text", "title": "Notes", "content": "hello"}
+            ]
+          }
+
+        Source type may be omitted and will be auto-detected like `source add`.
+        """
+        manifest = _load_bootstrap_manifest(manifest_path)
+
+        async def _run():
+            async with NotebookLMClient(client_auth) as client:
+                notebooks = await client.notebooks.list()
+                notebook = None
+                notebook_action = "created"
+
+                if manifest["if_exists"] in {"reuse", "error"}:
+                    notebook = _find_notebook_by_title(notebooks, manifest["title"])
+                    if notebook is not None:
+                        if manifest["if_exists"] == "error":
+                            raise click.ClickException(
+                                f"Notebook already exists with title: {manifest['title']}"
+                            )
+                        notebook_action = "reused"
+
+                if notebook is None:
+                    notebook = await client.notebooks.create(manifest["title"])
+
+                if manifest["use"]:
+                    created_str = (
+                        notebook.created_at.strftime("%Y-%m-%d") if notebook.created_at else None
+                    )
+                    set_current_notebook(
+                        notebook.id,
+                        notebook.title,
+                        getattr(notebook, "is_owner", True),
+                        created_str,
+                    )
+
+                added_sources = []
+                for source in manifest["sources"]:
+                    detected_type = _detect_bootstrap_source_type(source)
+                    content = source["content"]
+                    title = source.get("title")
+                    mime_type = source.get("mime_type")
+
+                    if detected_type in {"url", "youtube"}:
+                        src = await client.sources.add_url(notebook.id, content)
+                    elif detected_type == "text":
+                        src = await client.sources.add_text(notebook.id, title or "Untitled", content)
+                    else:
+                        src = await client.sources.add_file(
+                            notebook.id,
+                            content,
+                            mime_type,
+                            title=title,
+                        )
+
+                    added_sources.append(
+                        {
+                            "id": src.id,
+                            "title": src.title,
+                            "type": str(src.kind),
+                            "url": src.url,
+                            "detected_type": detected_type,
+                        }
+                    )
+
+                if json_output:
+                    json_output_response(
+                        {
+                            "manifest_path": manifest["path"],
+                            "notebook": {
+                                "id": notebook.id,
+                                "title": notebook.title,
+                                "action": notebook_action,
+                            },
+                            "use": manifest["use"],
+                            "sources_added": added_sources,
+                            "source_count": len(added_sources),
+                        }
+                    )
+                    return
+
+                console.print(
+                    f"[green]{notebook_action.title()} notebook:[/green] {notebook.id} - {notebook.title}"
+                )
+                console.print(
+                    f"[green]Imported {len(added_sources)} source(s)[/green] from {manifest['path']}"
+                )
+                if manifest["use"]:
+                    console.print("[dim]Context set to bootstrapped notebook[/dim]")
+
+        if not json_output:
+            with console.status("Bootstrapping notebook from manifest..."):
+                return _run()
         return _run()
 
     @cli.command("delete")
